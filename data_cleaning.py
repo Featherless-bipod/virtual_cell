@@ -2,6 +2,12 @@ import scanpy as sc
 import numpy as np
 import matplotlib.pyplot as plt
 
+
+def get_control_data(adata):
+    is_control = adata.obs['target_gene'] == "non-targeting"
+    control_adata = adata[is_control].copy()
+    return control_adata
+
 def adaptive_clean_and_preprocess_data(adata: sc.AnnData, 
                                          mad_cutoff=3.0) -> sc.AnnData:
     """

@@ -9,7 +9,7 @@ import pathway_encoding as path
 import position_encoding as pos
 
 gene_names = pd.read_csv('vcc_data/gene_names.csv',header = None)
-adata = sc.read_h5ad('vcc_data/data_Training.h5ad')
+adata = sc.read_h5ad('vcc_data/adata_Training.h5ad')
 
 CONFIG = {
     "n_genes": len(gene_names),
@@ -76,7 +76,8 @@ class TranscriptomePredictor(nn.Module):
         self.input_proj = nn.Linear(GENE_FEAT_DIM, config["d_model"])
 
         # --- Core Model Backbone ---
-        self.backbone = Mamba(d_model=config["d_model"], n_layers=config["mamba_layers"])
+        #self.backbone = Mamba(d_model=config["d_model"], n_layers=config["mamba_layers"])
+        self.backbone = nn.LSTM(d_model=config["d_model"], n_layers=config["mamba_layers"])
 
         # --- Prediction Heads ---
         self.head = nn.Linear(config["d_model"], 1)
@@ -136,9 +137,7 @@ class TranscriptomePredictor(nn.Module):
             return out
 
 
-# ---------------------------------------------------------------------------- #
-#                 SECTION 4: DATASET, LOSS, AND TRAINING LOOP                  #
-# ---------------------------------------------------------------------------- #
+
 
 class PerturbationDataset(Dataset):
     def __init__(self, adata):
@@ -189,31 +188,3 @@ def train_model(model, dataloader, config):
             if i % 10 == 0:
                 print(f"Epoch {ep+1}/{config['epochs']}, Batch {i+1}/{len(dataloader)}, Loss: {loss.item():.4f}")
         print(f"--- Epoch {ep+1} Average Loss: {total_loss / len(dataloader):.4f} ---")
-
-
-# ---------------------------------------------------------------------------- #
-#                         SECTION 5: MAIN EXECUTION BLOCK                        #
-# ---------------------------------------------------------------------------- #
-if __name__ == '__main__':
-    # 1. Create Dummy Data (replace with real data)
-    # For probabilistic head, use raw-ish counts
-    dummy_counts = np.random.poisson(lam=2.0, size=(500, CONFIG["n_genes"]))
-    adata = sc.AnnData(dummy_counts)
-    adata.obs['perturbation_idx'] = np.random.randint(0, CONFIG["n_perturbations"], size=adata.n_obs)
-    sc.pp.calculate_qc_metrics(adata, inplace=True)
-
-    # 2. Pre-compute Fixed Features (run once, then save/load)
-    control_adata = sc.AnnData(np.random.poisson(lam=1.5, size=(1000, CONFIG["n_genes"])))
-    pathway_feats = precompute_pathway_features(control_adata, CONFIG)
-    chr_idx, locus_norm = precompute_positional_indices(None, CONFIG)
-
-    # 3. Instantiate Model, Dataset, Dataloader
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nUsing device: {device}")
-    model = TranscriptomePredictor(CONFIG, pathway_feats, chr_idx, locus_norm).to(device)
-    
-    dataset = PerturbationDataset(adata)
-    dataloader = DataLoader(dataset, batch_size=CONFIG["batch_size"], shuffle=True)
-
-    # 4. Train
-    train_model(model, dataloader, CONFIG)
