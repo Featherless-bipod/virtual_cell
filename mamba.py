@@ -1,5 +1,6 @@
-from mamba_ssm import Mamba
+#from mamba_ssm import Mamba
 import torch
+from torch import nn
 
 
 class BidirectionalMamba(nn.Module):
@@ -12,8 +13,16 @@ class BidirectionalMamba(nn.Module):
     def __init__(self, d_model, n_layers):
         super().__init__()
 
-        self.mamba_fwd = Mamba(d_model=d_model)
-        self.mamba_bwd = Mamba(d_model=d_model)
+        #self.mamba_fwd = Mamba(d_model=d_model)
+        #self.mamba_bwd = Mamba(d_model=d_model)
+
+        self.placeholder = nn.LSTM(
+            d_model, 
+            d_model, 
+            num_layers=n_layers, # Using n_layers here
+            batch_first=True, 
+            bidirectional=True
+        )
 
     def forward(self, x):
         """
@@ -23,7 +32,11 @@ class BidirectionalMamba(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (B, L, D)
         """
-        # 1. Forward pass
+        # A simple and effective way is to add them
+        y, _ = self.placeholder(x)
+        d_out = y.shape[-1] // 2
+        return y[..., :d_out] + y[..., d_out:]
+        """ # 1. Forward pass
         h_fwd = self.mamba_fwd(x) # (B, L, D)
 
         # 2. Backward pass
@@ -35,3 +48,6 @@ class BidirectionalMamba(nn.Module):
         h_combined = h_fwd + h_bwd
         
         return h_combined
+        """
+        
+        

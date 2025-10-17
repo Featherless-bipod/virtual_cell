@@ -8,38 +8,6 @@ import scanpy as sc
 import pathway_encoding as path
 import position_encoding as pos
 
-gene_names = pd.read_csv('vcc_data/gene_names.csv',header = None)
-adata = sc.read_h5ad('vcc_data/adata_Training.h5ad')
-
-CONFIG = {
-    "n_genes": len(gene_names),
-    "n_perturbations": adata.X.shape[0],
-    "n_chromosomes": 24,
-
-    "perturbation_dim": 254,      # Condition embedding
-    "chrom_embedding_dim": 16,     # Learned in-model for chromosome identity
-    "locus_fourier_features": 8,   # Number of Fourier frequency pairs (2*F)
-    "pathway_dim": 50,             # From pre-trained Autoencoder(based on hallmark MSigDB)
-    "gene_identity_dim": 189,       # Main learnable gene embedding
-
-    # Backbone dims
-    "d_model": 512,                # Mamba hidden size
-    "mamba_layers": 4,
-
-    # Head
-    "prediction_head": "linear", # "linear" | "probabilistic"
-
-    # Training
-    "batch_size": 16,
-    "learning_rate": 1e-4, # Lowered LR for AdamW stability
-    "epochs": 10,
-}
-
-# Derived dimensions for clarity
-# Positional encoding dim = chromosome embedding + MLP output from Fourier features
-POS_DIM = CONFIG["chrom_embedding_dim"] + CONFIG["chrom_embedding_dim"]
-GENE_FEAT_DIM = CONFIG["gene_identity_dim"] + CONFIG["pathway_dim"] + POS_DIM
-
 
 '''class Mamba(nn.Module):
     """Placeholder for the Mamba implementation. Replace with `mamba-ssm`."""
@@ -52,18 +20,18 @@ GENE_FEAT_DIM = CONFIG["gene_identity_dim"] + CONFIG["pathway_dim"] + POS_DIM
         return y[..., :d] + y[..., d:]'''
 
 class TranscriptomePredictor(nn.Module):
-    def __init__(self, config, pathway_features, chr_idx, locus_fourier):
+    def __init__(self, config, GENE_FEAT_DIM, pathway_features, chr_idx, locus_fourier):
         super().__init__()
         self.cfg = config
-        
+
         # --- Register buffers for fixed, non-trainable data ---
         self.register_buffer('chr_idx', chr_idx)
         self.register_buffer('locus_fourier', locus_fourier)
         self.register_buffer('pathway_features', torch.tensor(pathway_features, dtype=torch.float32))
-        self.register_buffer('all_gene_idx', torch.arange(config["n_genes"], dtype=torch.long))
-
+        self.register_buffer('all_gene_idx', torch.arange(config['n_genes'], dtype=torch.long))
+        print(self.all_gene_idx.shape)
         # --- Learnable Modules for Feature Generation ---
-        self.gene_id_emb = nn.Embedding(config["n_genes"], config["gene_identity_dim"])
+        self.gene_id_emb = nn.Embedding(config['n_genes'], config["gene_identity_dim"])
         self.chr_emb = nn.Embedding(config["n_chromosomes"], config["chrom_embedding_dim"])
         self.locus_mlp = nn.Sequential(
             nn.Linear(2 * config["locus_fourier_features"], config["chrom_embedding_dim"]),
@@ -72,15 +40,16 @@ class TranscriptomePredictor(nn.Module):
         self.pert_emb = nn.Embedding(config["n_perturbations"], config["perturbation_dim"])
         
         # --- Projection Layers to Interface with Backbone ---
-        self.cond_proj = nn.Linear(config["perturbation_dim"] + 2, GENE_FEAT_DIM)
+        self.cond_proj = nn.Linear(config["perturbation_dim"], GENE_FEAT_DIM)
         self.input_proj = nn.Linear(GENE_FEAT_DIM, config["d_model"])
 
         # --- Core Model Backbone ---
         #self.backbone = Mamba(d_model=config["d_model"], n_layers=config["mamba_layers"])
-        self.backbone = nn.LSTM(d_model=config["d_model"], n_layers=config["mamba_layers"])
+        self.backbone = nn.LSTM(config['d_model'],config['d_model'], num_layers=config['mamba_layers'],batch_first =True, bidirectional=True  )
 
         # --- Prediction Heads ---
         self.head = nn.Linear(config["d_model"], 1)
+
         
         '''
         elif config["prediction_head"] == "probabilistic":
@@ -94,23 +63,33 @@ class TranscriptomePredictor(nn.Module):
 
     def build_gene_features(self, B, device):
         """Helper to construct the full (B, G, D_feat) gene feature matrix."""
+        #gpuuuuuu
         if self.gene_feature_cache is None:
             e_id = self.gene_id_emb(self.all_gene_idx)
+            print(f"e_id shape: {e_id.shape}")
+            print(f"all_gene_idx shape: {self.all_gene_idx.shape}")
+            
             e_chr = self.chr_emb(self.chr_idx)
             e_locus = self.locus_mlp(self.locus_fourier)
             e_pos = torch.cat([e_chr, e_locus], dim=1)
+            print(e_pos.shape)
+            print(f"e_pos shape: {e_pos.shape}")
+            print(f"chr_idx shape: {self.chr_idx.shape}")
             e_path = self.pathway_features
+            print(e_path.shape)
+            print(f"epath shape: {e_path.shape}")
+            print(f"pathway_features shape: {self.pathway_features.shape}")
             
             self.gene_feature_cache = torch.cat([e_id, e_path, e_pos], dim=1).to(device)
         
         # Expand for batching
         return self.gene_feature_cache.unsqueeze(0).expand(B, -1, -1)
 
-    def forward(self, perturbation_idx, cell_covariates):
+    def forward(self, perturbation_idx):
         B, device = perturbation_idx.shape[0], perturbation_idx.device
 
         # 1. Condition Token: (Perturbation + Cell Covariates) -> Projected
-        cond_vec = torch.cat([self.pert_emb(perturbation_idx), cell_covariates], dim=1)
+        cond_vec = self.pert_emb(perturbation_idx)
         cond_token = self.cond_proj(cond_vec).unsqueeze(1) # (B, 1, GENE_FEAT_DIM)
 
         # 2. Gene Matrix: (Identity + Pathway + Position)
@@ -127,21 +106,21 @@ class TranscriptomePredictor(nn.Module):
         # 5. Prediction Head
         out = self.head(H_genes)
 
-        if self.cfg["prediction_head"] == "probabilistic":
-            mean_log, disp_log = out.tensor_split(2, dim=-1)
-            log_umi = cell_covariates[:, 0].view(B, 1, 1) # (B, 1, 1) library size
+        #if self.cfg["prediction_head"] == "probabilistic":
+            #mean_log, disp_log = out.tensor_split(2, dim=-1)
+            #og_umi = cell_covariates[:, 0].view(B, 1, 1) # (B, 1, 1) library size
             # Adjust mean by library size
-            mean_log = mean_log + self.alpha_lib * log_umi
-            return mean_log, disp_log
-        else:
-            return out
+            #mean_log = mean_log + self.alpha_lib * log_umi
+            #return mean_log, disp_log
+        #else:
+        return out
 
 
 
 
 class PerturbationDataset(Dataset):
     def __init__(self, adata):
-        self.perturbations = adata.obs['perturbation_idx'].values
+        self.perturbations = adata.obs['perturbation_idx']
         self.covariates = np.log1p(adata.obs[['total_counts','n_genes_by_counts']].values)
         X = adata.X
         self.expression = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
@@ -149,7 +128,6 @@ class PerturbationDataset(Dataset):
     def __getitem__(self, idx):
         return {
             "perturbation_idx": torch.tensor(self.perturbations[idx], dtype=torch.long),
-            "cell_covariates": torch.tensor(self.covariates[idx], dtype=torch.float32),
             "target_expression": torch.tensor(self.expression[idx], dtype=torch.float32).unsqueeze(-1)
         }
 
@@ -172,15 +150,14 @@ def train_model(model, dataloader, config):
         for i, batch in enumerate(dataloader):
             opt.zero_grad(set_to_none=True)
             pert_idx = batch["perturbation_idx"].to(next(model.parameters()).device)
-            covariates = batch["cell_covariates"].to(next(model.parameters()).device)
             targets = batch["target_expression"].to(next(model.parameters()).device)
 
-            if config["prediction_head"] == "probabilistic":
-                mean_log, disp_log = model(pert_idx, covariates)
-                loss = nb_nll_loss(targets, mean_log, disp_log)
-            else:
-                predictions = model(pert_idx, covariates)
-                loss = nn.functional.mse_loss(predictions, targets)
+            #if config["prediction_head"] == "probabilistic":
+                #mean_log, disp_log = model(pert_idx, covariates)
+                #loss = nb_nll_loss(targets, mean_log, disp_log)
+            #else:
+            predictions = model(pert_idx)
+            loss = nn.functional.mse_loss(predictions, targets)
 
             loss.backward()
             opt.step()
