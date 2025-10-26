@@ -4,10 +4,14 @@ This project implements a state-of-the-art deep learning model to predict the fu
 
 The architecture is based on modern sequence modeling principles, treating the genome as a sequence and using a powerful backbone like Mamba to learn complex, long-range biological interactions.
 
+## Status: 
+Code has not been updated to current version as files have been moved to Google Drive to be ran by Colab ([here](https://drive.google.com/drive/folders/1OdyucB5qQCvy95UcbjAJk0tHMiWi-o-F?usp=sharing)).
+
+Additionally, Code is experiencing a CUDA illegal memory accessing error and is currently undergoing dubugging. Please forgive this sudden occurance. 
+
 ## Model Architecture
 
 The model is designed as a causal predictor, learning the function `f(Cause, Baseline_State) -> Effect`. It fuses information about the specific experimental **condition** with a rich, universal representation of all **genes**.
-
 
 
 ### 1. Input Sequence Construction
@@ -51,6 +55,18 @@ A rigorous, multi-stage QC and pre-processing pipeline is essential.
 3.  **Data Representation:** The pre-processing pipeline correctly prepares two versions of the expression data:
     * **`adata.X`:** Normalized (CP10k) and log-transformed (`log1p`) data, used for training the `PathwayAutoencoder`.
     * **`adata.layers['counts']`:** The original, raw integer counts, used as the target for the main model when using the `probabilistic` head.
+
+
+## Folders and Files
+
+- `main.ipynb`: The main notebook file is where the model can be accessed and trained
+- `src`: contains functions
+    - `data_cleaning.py`: Contains functions used for pre-processing expression data from .h5ad file
+    - `pathway_encoding.py`: Contains functions used for creating the pre-computed pathway embedding matrix
+    - `position_encoding.py`: Contains functions used for creating hte position embedding matrix
+    - `mamba.py`: Contains the BERT-like bidirectional mamba class used as the model backbone
+    - `model.py`: Contains functions for creating datasets and training model
+- `scratch.ipynb`: Notebook used to test sanity and design functions
 
 ## Setup and Usage
 

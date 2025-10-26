@@ -3,22 +3,28 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import pandas as pd
-import scanpy as sc
-import pathway_encoding as path
-import position_encoding as pos
+import matplotlib.pyplot as plt
+from mamba_ssm.modules.mamba2 import Mamba2
 
 
-'''class Mamba(nn.Module):
-    """Placeholder for the Mamba implementation. Replace with `mamba-ssm`."""
-    def __init__(self, d_model, n_layers):
+class Mamba(nn.Module):
+    def __init__(self, d_model):
         super().__init__()
-        self.placeholder = nn.LSTM(d_model, d_model, n_layers, batch_first=True, bidirectional=True)
+        self.mamba_fwd = Mamba2(d_model=d_model)
+        self.mamba_bwd = Mamba2(d_model=d_model)
     def forward(self, x):
-        y, _ = self.placeholder(x)
-        d = y.shape[-1] // 2
-        return y[..., :d] + y[..., d:]'''
+        h_fwd = self.mamba_fwd(x)
 
+        # 2. Backward pass
+        x_rev = torch.flip(x, dims=[1])
+        h_bwd_rev = self.mamba_bwd(x_rev)
+        h_bwd = torch.flip(h_bwd_rev, dims=[1])
+
+        # 3. Combine the outputs
+        h_combined = h_fwd + h_bwd
+        
+        return h_combined
+    
 class TranscriptomePredictor(nn.Module):
     def __init__(self, config, GENE_FEAT_DIM, pathway_features, chr_idx, locus_fourier):
         super().__init__()
@@ -44,43 +50,30 @@ class TranscriptomePredictor(nn.Module):
         self.input_proj = nn.Linear(GENE_FEAT_DIM, config["d_model"])
 
         # --- Core Model Backbone ---
-        #self.backbone = Mamba(d_model=config["d_model"], n_layers=config["mamba_layers"])
-        self.backbone = nn.LSTM(config['d_model'],config['d_model'], num_layers=config['mamba_layers'],batch_first =True, bidirectional=True  )
+        self.backbone = Mamba(d_model=config["d_model"])
+        #self.backbone = nn.LSTM(config['d_model'],config['d_model'], num_layers=config['mamba_layers'],batch_first =True, bidirectional=True  )
 
         # --- Prediction Heads ---
-        self.head = nn.Linear(config["d_model"], 1)
-
-        
-        '''
+        if config["prediction_head"] == "linear":
+            self.head = nn.Linear(config["d_model"], 1)
         elif config["prediction_head"] == "probabilistic":
             self.head = nn.Linear(config["d_model"], 2) # Outputs log(mean) and log(dispersion)
-            self.alpha_lib = nn.Parameter(torch.zeros(1)) # Learnable library size coefficient
         else:
             raise ValueError("Unknown prediction_head in config")
-        '''
-        # --- Caching for efficiency ---
-        self.gene_feature_cache = None
 
     def build_gene_features(self, B, device):
         """Helper to construct the full (B, G, D_feat) gene feature matrix."""
         #gpuuuuuu
-        if self.gene_feature_cache is None:
-            e_id = self.gene_id_emb(self.all_gene_idx)
-            print(f"e_id shape: {e_id.shape}")
-            print(f"all_gene_idx shape: {self.all_gene_idx.shape}")
+        e_id = self.gene_id_emb(self.all_gene_idx)
+        print(f"e_id shape: {e_id.shape}")
+        print(f"all_gene_idx shape: {self.all_gene_idx.shape}")
             
-            e_chr = self.chr_emb(self.chr_idx)
-            e_locus = self.locus_mlp(self.locus_fourier)
-            e_pos = torch.cat([e_chr, e_locus], dim=1)
-            print(e_pos.shape)
-            print(f"e_pos shape: {e_pos.shape}")
-            print(f"chr_idx shape: {self.chr_idx.shape}")
-            e_path = self.pathway_features
-            print(e_path.shape)
-            print(f"epath shape: {e_path.shape}")
-            print(f"pathway_features shape: {self.pathway_features.shape}")
+        e_chr = self.chr_emb(self.chr_idx)
+        e_locus = self.locus_mlp(self.locus_fourier)
+        e_pos = torch.cat([e_chr, e_locus], dim=1)
+        e_path = self.pathway_features
             
-            self.gene_feature_cache = torch.cat([e_id, e_path, e_pos], dim=1).to(device)
+        self.gene_feature_cache = torch.cat([e_id, e_path, e_pos], dim=1).to(device)
         
         # Expand for batching
         return self.gene_feature_cache.unsqueeze(0).expand(B, -1, -1)
@@ -100,35 +93,52 @@ class TranscriptomePredictor(nn.Module):
         seq = self.input_proj(seq)                        # (B, G+1, d_model)
 
         # 4. Process with Mamba Backbone
-        H = self.backbone(seq)
+        output = self.backbone(seq)
+
+        if isinstance(output, tuple):
+            # This case handles nn.LSTM output
+            H = output[0] 
+        else:
+            # This case handles your Mamba class output
+            H = output
+
         H_genes = H[:, 1:, :] # Discard condition token output -> (B, G, d_model)
 
         # 5. Prediction Head
         out = self.head(H_genes)
 
-        #if self.cfg["prediction_head"] == "probabilistic":
-            #mean_log, disp_log = out.tensor_split(2, dim=-1)
-            #og_umi = cell_covariates[:, 0].view(B, 1, 1) # (B, 1, 1) library size
-            # Adjust mean by library size
-            #mean_log = mean_log + self.alpha_lib * log_umi
-            #return mean_log, disp_log
-        #else:
-        return out
+        if self.cfg["prediction_head"] == "probabilistic":
+            mean_log, disp_log = out.tensor_split(2, dim=-1)
+            return mean_log, disp_log # Return the parameters directly
+        else:
+            return out
 
 
 
 
 class PerturbationDataset(Dataset):
-    def __init__(self, adata):
-        self.perturbations = adata.obs['perturbation_idx']
-        self.covariates = np.log1p(adata.obs[['total_counts','n_genes_by_counts']].values)
+    def __init__(self, adata,CONFIG):
+        # --- THE FIX IS HERE ---
+        # By adding .values, we convert the pandas Series to a simple NumPy array.
+        # This makes indexing with `idx` safe and unambiguous.
+        self.perturbations = adata.obs['perturbation_idx'].values
+        
+        # We should do the same for the covariates for consistency.
+        
+        # Use raw counts if probabilistic, otherwise use the log-normalized data in .X
+        print("Dataset using log-normalized data from adata.X for linear head.")
         X = adata.X
         self.expression = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
-    def __len__(self): return len(self.perturbations)
+
+    def __len__(self): 
+        return len(self.perturbations)
+
     def __getitem__(self, idx):
+        # This code now works correctly because self.perturbations is a NumPy array,
+        # so `idx` will always refer to the position.
         return {
             "perturbation_idx": torch.tensor(self.perturbations[idx], dtype=torch.long),
-            "target_expression": torch.tensor(self.expression[idx], dtype=torch.float32).unsqueeze(-1)
+            "target_expression": torch.tensor(self.expression[idx], dtype=torch.float32).unsqueeze(-self.expression.ndim)
         }
 
 def nb_nll_loss(y_true, mean_log, disp_log):
@@ -140,10 +150,28 @@ def nb_nll_loss(y_true, mean_log, disp_log):
     dist = torch.distributions.NegativeBinomial(total_count=disp.squeeze(-1), logits=logits.squeeze(-1))
     return -dist.log_prob(y_true.squeeze(-1)).mean()
 
+def plot_training_loss(epoch_losses):
+    """
+    Plots the training loss over epochs.
+
+    Args:
+        epoch_losses (list): A list of the average loss for each epoch.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o', linestyle='-')
+    plt.title("Training Loss vs. Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Average Loss")
+    plt.grid(True)
+    plt.xticks(range(1, len(epoch_losses) + 1))
+    plt.show()
+
 def train_model(model, dataloader, config):
     print("\n--- Starting Model Training ---")
     model.train()
     opt = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-2)
+    
+    epoch_loss_history = []
     
     for ep in range(config["epochs"]):
         total_loss = 0.0
@@ -152,16 +180,17 @@ def train_model(model, dataloader, config):
             pert_idx = batch["perturbation_idx"].to(next(model.parameters()).device)
             targets = batch["target_expression"].to(next(model.parameters()).device)
 
-            #if config["prediction_head"] == "probabilistic":
-                #mean_log, disp_log = model(pert_idx, covariates)
-                #loss = nb_nll_loss(targets, mean_log, disp_log)
-            #else:
-            predictions = model(pert_idx)
-            loss = nn.functional.mse_loss(predictions, targets)
+            if config["prediction_head"] == "probabilistic":
+                mean_log, disp_log = model(pert_idx)
+                loss = nb_nll_loss(targets, mean_log, disp_log)
+            else:
+                predictions = model(pert_idx)
+                loss = nn.functional.mse_loss(predictions, targets)
 
             loss.backward()
             opt.step()
             total_loss += loss.item()
+            
             if i % 10 == 0:
                 print(f"Epoch {ep+1}/{config['epochs']}, Batch {i+1}/{len(dataloader)}, Loss: {loss.item():.4f}")
         print(f"--- Epoch {ep+1} Average Loss: {total_loss / len(dataloader):.4f} ---")
