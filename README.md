@@ -126,3 +126,13 @@ The `main.py` script ties all components together.
 The training script automatically evaluates the model at the end of each epoch. The primary metric for performance is the **Validation $R^2$ Score**, which is plotted live. A score > 0.0 indicates the model is outperforming the baseline (mean) guess.
 
 ## 5. File Structure
+
+- `main.ipynb`: notebook used to run model
+- `src` (main code repository)
+    - `data_cleaning`: contains functions for cleaning data and extracting control data
+    - `pathway_encoding`: functions to create pathway embedder
+    - `position_encoding`: functions to create position embedder
+    - `modelnew.py`: contains backbone and data structure
+    - `trainingnew.py`: contains training, plotting, and loss function
+- `arc` (archived old algorithms)
+
