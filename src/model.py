@@ -39,22 +39,22 @@ class TranscriptomePredictor(nn.Module):
         self.register_buffer('all_gene_idx', torch.arange(config['n_genes'], dtype=torch.long))
         
         # --- Learnable Modules (all same as before) ---
+        self.control_token_emb = nn.Parameter(torch.zeros(1, GENE_FEAT_DIM))
         self.gene_id_emb = nn.Embedding(config['n_genes'], config["gene_identity_dim"])
         self.chr_emb = nn.Embedding(config["n_chromosomes"], config["chrom_embedding_dim"])
         self.locus_mlp = nn.Sequential(
             nn.Linear(2 * config["locus_fourier_features"], config["chrom_embedding_dim"]),
             nn.GELU(),
-        )
-        self.pert_emb = nn.Embedding(config["n_perturbations"], config["perturbation_dim"])
-        
+        )        
         # --- Projection Layers (all same as before) ---
-        self.cond_proj = nn.Linear(config["perturbation_dim"], GENE_FEAT_DIM)
+        self.cond_proj = nn.Linear(GENE_FEAT_DIM, GENE_FEAT_DIM)
         self.input_proj = nn.Linear(GENE_FEAT_DIM, config["d_model"])
         self.input_norm = nn.LayerNorm(config["d_model"])
 
 
         # --- Core Model Backbone (all same as before) ---
         self.backbone = BiMamba(d_model=config["d_model"])
+        self.output_norm = nn.LayerNorm(config["d_model"])
 
         # --- Prediction Heads (all same as before) ---
         if config["prediction_head"] == "linear":
@@ -72,15 +72,16 @@ class TranscriptomePredictor(nn.Module):
         e_pos = torch.cat([e_chr, e_locus], dim=1)
         e_path = self.pathway_features
         self.gene_feature_cache = torch.cat([e_id, e_path, e_pos], dim=1).to(device)
+        self.all_features = torch.cat([self.gene_feature_cache, self.control_token_emb], dim=0)
         return self.gene_feature_cache.unsqueeze(0).expand(B, -1, -1)
 
     def forward(self, perturbation_idx):
         B, device = perturbation_idx.shape[0], perturbation_idx.device
         
         # --- 1-3. Build sequence (same as before) ---
-        cond_vec = self.pert_emb(perturbation_idx)
-        cond_token = self.cond_proj(cond_vec).unsqueeze(1)
         gene_matrix = self.build_gene_features(B, device)
+        cond_vec = self.all_features[perturbation_idx]
+        cond_token = self.cond_proj(cond_vec).unsqueeze(1)
         seq = torch.cat([cond_token, gene_matrix], dim=1)
         seq = self.input_proj(seq) # Shape is (B, 18081, 512)
         seq = self.input_norm(seq)
@@ -127,6 +128,7 @@ class TranscriptomePredictor(nn.Module):
         
         # Discard condition token (at position 0)
         H_genes = H[:, 1:, :] 
+        H_genes = self.output_norm(H_genes)
         out = self.head(H_genes)
 
         if self.cfg["prediction_head"] == "probabilistic":

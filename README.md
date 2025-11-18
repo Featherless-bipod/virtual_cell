@@ -92,16 +92,16 @@ The pipeline is split into preprocessing, training, and evaluation.
     ```
 5.  **Precompute Control Features:**
     ```python
-    # (Assuming 'preprocessing.py' contains your functions)
-    import preprocessing as pp
-    
+    import src.position_encoding as pos
+    import src.pathway_encoding as path
+
     control_adata = adata[adata.obs['cell_type'] == 'control']
     
     # Run 1: Get positional features
-    chr_idx, locus_norm, locus_fourier = pp.precompute_positional_indices(gene_names, CONFIG)
+    chr_idx, locus_norm, locus_fourier = path.precompute_positional_indices(gene_names, CONFIG)
     
     # Run 2: Pre-train autoencoder on control data
-    pathway_feats = pp.precompute_pathway_features(control_adata, CONFIG)
+    pathway_feats = pos.precompute_pathway_features(control_adata, CONFIG)
     ```
 
 ### Step 2: Training

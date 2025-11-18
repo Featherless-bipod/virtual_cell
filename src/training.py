@@ -115,9 +115,10 @@ def train_model(model, dataloader, config, device):
             current_loss = loss.item()
             total_loss += current_loss
             pbar.set_postfix({"Loss": f"{current_loss:.4f}"})
+            
 
         scheduler.step()
-        
+        torch.save(model.state_dict(), "drive/MyDrive/Projects/MambaPerturb/virtual_cell/model_weights2.pth")
         # --- Plotting ---
         avg_epoch_loss = total_loss / len(dataloader)
         epoch_loss_history.append(avg_epoch_loss)
