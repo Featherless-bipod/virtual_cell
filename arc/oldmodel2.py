@@ -6,23 +6,57 @@ import numpy as np
 from mamba_ssm.modules.mamba2 import Mamba2
 from tqdm import tqdm
 
-class Mamba(nn.Module):
+class BiMamba(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.mamba_fwd = Mamba2(d_model=d_model)
         self.mamba_bwd = Mamba2(d_model=d_model)
+        self.linear = nn.Linear(d_model,d_model) 
     def forward(self, x):
+        print("0")
         h_fwd = self.mamba_fwd(x)
-
+        
+        print("1")
         # 2. Backward pass
         x_rev = torch.flip(x, dims=[1])
+        print("2")
         h_bwd_rev = self.mamba_bwd(x_rev)
+        print("3")
         h_bwd = torch.flip(h_bwd_rev, dims=[1])
+        print("4")
 
         # 3. Combine the outputs
         h_combined = h_fwd + h_bwd
         
         return h_combined
+
+class TransformerBackbone(nn.Module):
+    def __init__(self, d_model=512, nhead=8, num_layers=4, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers
+        )
+    def forward(self, x):
+        return self.transformer_encoder(x)
+
+class Linear(nn.Module):
+    def __init(self,d_model):
+        super().__init()
+        self.linear = nn.Linear(d_model,d_model)
+    def foward(self,x):
+        out = self.linear(x)
+        return out
+
     
 class TranscriptomePredictor(nn.Module):
     def __init__(self, config, GENE_FEAT_DIM, pathway_features, chr_idx, locus_fourier):
@@ -33,7 +67,7 @@ class TranscriptomePredictor(nn.Module):
         self.register_buffer('chr_idx', chr_idx)
         self.register_buffer('locus_fourier', locus_fourier)
         self.register_buffer('pathway_features', torch.tensor(pathway_features, dtype=torch.float32))
-        self.register_buffer('all_gene_idx', torch.arange(config['n_genes'], dtype=torch.long))
+        self.register_buffer('all_gene_idx', torch.arange(config['n_genes'], dtype=torch.long)) #all the different genes that have their expressions measuresd
         # --- Learnable Modules for Feature Generation ---
         self.gene_id_emb = nn.Embedding(config['n_genes'], config["gene_identity_dim"])
         self.chr_emb = nn.Embedding(config["n_chromosomes"], config["chrom_embedding_dim"])
@@ -48,7 +82,12 @@ class TranscriptomePredictor(nn.Module):
         self.input_proj = nn.Linear(GENE_FEAT_DIM, config["d_model"])
 
         # --- Core Model Backbone ---
-        self.backbone = Mamba(d_model=config["d_model"])
+        self.backbone = BiMamba(d_model=config["d_model"])
+        #self.backbone = TransformerBackbone(
+            #d_model=config["d_model"],
+            #nhead=config["n_heads"],
+            #num_layers=config["n_layers"]
+        #)
         #self.backbone = nn.LSTM(config['d_model'],config['d_model'], num_layers=config['mamba_layers'],batch_first =True, bidirectional=True  )
 
         # --- Prediction Heads ---
@@ -62,10 +101,10 @@ class TranscriptomePredictor(nn.Module):
     def build_gene_features(self, B, device):
         """Helper to construct the full (B, G, D_feat) gene feature matrix."""
         #gpuuuuuu
-        e_id = self.gene_id_emb(self.all_gene_idx)
-        e_chr = self.chr_emb(self.chr_idx)
-        e_locus = self.locus_mlp(self.locus_fourier)
-        e_pos = torch.cat([e_chr, e_locus], dim=1)
+        e_id = self.gene_id_emb(self.all_gene_idx) #(n_gene,189)
+        e_chr = self.chr_emb(self.chr_idx) #(n_gene,16)
+        e_locus = self.locus_mlp(self.locus_fourier) #(n_gene,16)
+        e_pos = torch.cat([e_chr, e_locus], dim=1) #(n_gene, 32)
         e_path = self.pathway_features
             
         self.gene_feature_cache = torch.cat([e_id, e_path, e_pos], dim=1).to(device)
@@ -87,15 +126,12 @@ class TranscriptomePredictor(nn.Module):
         seq = torch.cat([cond_token, gene_matrix], dim=1) # (B, G+1, GENE_FEAT_DIM)
         seq = self.input_proj(seq)                        # (B, G+1, d_model)
 
+        print(f"-------shape of seq{seq.shape}-------")
+
         # 4. Process with Mamba Backbone
         output = self.backbone(seq)
-
-        if isinstance(output, tuple):
-            # This case handles nn.LSTM output
-            H = output[0] 
-        else:
-            # This case handles your Mamba class output
-            H = output
+        
+        H = output
 
         H_genes = H[:, 1:, :] # Discard condition token output -> (B, G, d_model)
 
@@ -107,8 +143,6 @@ class TranscriptomePredictor(nn.Module):
             return mean_log, disp_log # Return the parameters directly
         else:
             return out
-
-
 
 
 class PerturbationDataset(Dataset):
@@ -135,89 +169,3 @@ class PerturbationDataset(Dataset):
             "perturbation_idx": torch.tensor(self.perturbations[idx], dtype=torch.long),
             "target_expression": torch.tensor(self.expression[idx], dtype=torch.float32).unsqueeze(-1)
         }
-
-def nb_nll_loss(y_true, mean_log, disp_log):
-    """Numerically stable Negative Binomial Negative Log-Likelihood loss."""
-    mean = torch.exp(mean_log)
-    # Use softplus for safe, positive dispersion
-    disp = torch.nn.functional.softplus(disp_log) + 1e-6
-    logits = torch.log(mean + 1e-8) - torch.log(mean + disp + 1e-8)
-    dist = torch.distributions.NegativeBinomial(total_count=disp.squeeze(-1), logits=logits.squeeze(-1))
-    return -dist.log_prob(y_true.squeeze(-1)).mean()
-
-def plot_training_loss(epoch_losses):
-    """
-    Plots the training loss over epochs.
-
-    Args:
-        epoch_losses (list): A list of the average loss for each epoch.
-    """
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o', linestyle='-')
-    plt.title("Training Loss vs. Epoch")
-    plt.xlabel("Epoch")
-    plt.ylabel("Average Loss")
-    plt.grid(True)
-    plt.xticks(range(1, len(epoch_losses) + 1))
-    plt.show()
-
-def train_model(model, dataloader, config):
-    print("\n--- Starting Model Training ---")
-    model.train()
-    opt = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=1e-2)
-    
-    epoch_loss_history = []
-
-    for ep in range(config["epochs"]):
-        total_loss = 0.0
-        # The tqdm pbar will show the per-batch progress
-        pbar = tqdm(dataloader, desc=f"Epoch {ep+1}/{config['epochs']}", leave=False)
-        
-        for i, batch in enumerate(pbar):
-            opt.zero_grad(set_to_none=True)
-            pert_idx = batch["perturbation_idx"].to(next(model.parameters()).device)
-            targets = batch["target_expression"].to(next(model.parameters()).device)
-
-            if config["prediction_head"] == "probabilistic":
-                mean_log, disp_log = model(pert_idx)
-                loss = nb_nll_loss(targets, mean_log, disp_log)
-            else:
-                predictions = model(pert_idx)
-                loss = nn.functional.mse_loss(predictions, targets)
-
-            loss.backward()
-            opt.step()
-            
-            current_loss = loss.item()
-            total_loss += current_loss
-            pbar.set_postfix({"Loss": f"{current_loss:.4f}"})
-
-        # --- THE LIVE PLOTTING LOGIC (MODIFIED) ---
-        avg_epoch_loss = total_loss / len(dataloader)
-        epoch_loss_history.append(avg_epoch_loss)
-        
-        # Clear the output of the current cell to prepare for the new plot
-        clear_output(wait=True)
-        
-        # Create the plot
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(range(1, len(epoch_loss_history) + 1), epoch_loss_history, marker='o', linestyle='-')
-        ax.set_title("Live Training Loss vs. Epoch")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Average Loss")
-        ax.grid(True)
-        ax.set_xticks(range(1, len(epoch_loss_history) + 1))
-        
-        # --- THE CHANGE IS HERE ---
-        # Add the latest loss information as text at the bottom of the figure
-        status_text = f"Latest Loss (Epoch {ep+1}): {avg_epoch_loss:.6f}"
-        fig.text(0.5, 0.01, status_text, ha='center', va='bottom', fontsize=12)
-        
-        # Adjust layout to prevent the text from being cut off
-        plt.tight_layout(pad=3.0)
-        
-        # Display the updated plot
-        plt.show()
-
-    print("\n--- Training Complete ---")
-    return epoch_loss_history
